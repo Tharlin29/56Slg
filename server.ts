@@ -15,6 +15,17 @@ const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
 app.use(express.json());
 
+// Enable CORS for iframe and preview environments
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  next();
+});
+
 // Interfaces for ShweLottery Wingo Draws
 interface WingoDraw {
   period: string;
@@ -196,7 +207,7 @@ function convertServerToMmt(serverDt: Date): Date {
 }
 
 // Resilient fetch wrapper for ShweLottery API (prevents ECONNRESET and connection hangs)
-async function safeShwePost(url: string, payload: any, token?: string, retries = 2): Promise<any> {
+async function safeShwePost(url: string, payload: any, token?: string, retries = 1): Promise<any> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json;charset=UTF-8',
     'Ar-Origin': 'https://www.shwelottery.net',
@@ -217,7 +228,7 @@ async function safeShwePost(url: string, payload: any, token?: string, retries =
         method: 'POST',
         headers,
         body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(6000)
+        signal: AbortSignal.timeout(3000)
       });
       if (!res.ok) {
         throw new Error(`HTTP ${res.status}`);
@@ -227,7 +238,7 @@ async function safeShwePost(url: string, payload: any, token?: string, retries =
       if (i === retries) {
         return null;
       }
-      await new Promise((resolve) => setTimeout(resolve, 300 * (i + 1)));
+      await new Promise((resolve) => setTimeout(resolve, 200 * (i + 1)));
     }
   }
   return null;
@@ -361,26 +372,38 @@ async function performShweLogin(rawPhone = '9798023829', password = '166061kp'):
 }
 
 // Fetch Real Live User Balance from ShweLottery API Gateway (GetBalance / GetUserInfo)
+let isSyncingBalance = false;
+let lastBalanceSync = 0;
 async function fetchRealUserBalance(): Promise<number> {
   if (!activeSession || !activeSession.token) {
     return 1000;
   }
 
+  // Rate-limit balance requests to at most once per 4 seconds
+  if (Date.now() - lastBalanceSync < 4000 || isSyncingBalance) {
+    return parseFloat(activeSession.amount || '1000');
+  }
+
+  isSyncingBalance = true;
   try {
     const payload = signShwePayload({});
     const data = await safeShwePost(
       'https://api.shweshwbb.com/api/webapi/GetBalance',
       payload,
-      `${activeSession.tokenHeader}${activeSession.token}`
+      `${activeSession.tokenHeader}${activeSession.token}`,
+      1
     );
 
     if (data && data.code === 0 && data.data && typeof data.data.amount !== 'undefined') {
       const realAmount = Number(data.data.amount);
       activeSession.amount = realAmount.toFixed(2);
+      lastBalanceSync = Date.now();
       return realAmount;
     }
   } catch (err) {
     // Return cached balance on network drop
+  } finally {
+    isSyncingBalance = false;
   }
 
   return parseFloat(activeSession.amount || '1000');
@@ -490,8 +513,14 @@ async function placeRealBetOnShweLottery(params: {
   }
 }
 
+const isSyncingPerType: Record<number, boolean> = {};
+
 // Fetch Game Issue & Draw History from ShweLottery API Gateway (resilient to connection drops)
 async function syncGameDataForType(typeId: number): Promise<GameStatePerType> {
+  if (isSyncingPerType[typeId]) {
+    return gameCache[typeId] || gameCache[1];
+  }
+  isSyncingPerType[typeId] = true;
   const target = gameCache[typeId] || gameCache[1];
   const calculated = computeCurrentPeriod(typeId);
 
@@ -603,6 +632,8 @@ async function syncGameDataForType(typeId: number): Promise<GameStatePerType> {
     }
     target.currentIssueNumber = target.currentIssueNumber || calculated.issueNumber;
     target.secondsLeft = target.secondsLeft || calculated.secondsLeft;
+  } finally {
+    isSyncingPerType[typeId] = false;
   }
 
   return target;
@@ -658,25 +689,26 @@ app.post('/api/shwelottery/login', async (req: Request, res: Response) => {
 // 2. Real Wingo History & Current Active Period (Supports ?typeid=1 or 30 or 2 or 3)
 app.get('/api/shwelottery/wingo-history', async (req: Request, res: Response) => {
   const typeId = parseInt(String(req.query.typeid || '1'), 10) || 1;
-  let target = gameCache[typeId];
-  if (!target) {
-    target = gameCache[1];
+  let target = gameCache[typeId] || gameCache[1];
+
+  // Immediately compute real clock countdown & period so client response is always instant
+  const calculated = computeCurrentPeriod(typeId);
+  target.secondsLeft = calculated.secondsLeft;
+  if (!target.currentIssueNumber) {
+    target.currentIssueNumber = calculated.issueNumber;
   }
 
-  // If data is older than 2.5 seconds, force a fresh sync immediately
-  if (Date.now() - target.lastSync > 2500 || target.history.length === 0) {
+  // If cold start without history, wait once for bootstrap
+  if (target.history.length === 0) {
     await syncGameDataForType(typeId);
-    if (activeSession) {
-      await fetchRealUserBalance();
-    }
-    target = gameCache[typeId];
+    target = gameCache[typeId] || gameCache[1];
+  } else if (Date.now() - target.lastSync > 2500 && !isSyncingPerType[typeId]) {
+    // Background async sync: never block the HTTP response!
+    syncGameDataForType(typeId).catch(() => {});
   }
 
   const latestDraw = target.history[0] || null;
-
-  // IMPORTANT: The target period being bet on and predicted is the CURRENT ACTIVE issueNumber!
-  // E.g., if issueNumber is 20261105100010190, that is the period currently counting down on shwelottery.net!
-  const currentBettingPeriod = target.currentIssueNumber || (latestDraw ? (BigInt(latestDraw.period) + 1n).toString() : '');
+  const currentBettingPeriod = target.currentIssueNumber || (latestDraw ? (BigInt(latestDraw.period) + 1n).toString() : calculated.issueNumber);
 
   res.json({
     success: true,

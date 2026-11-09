@@ -351,7 +351,8 @@ export default function App() {
         }
       }
     } catch (e) {
-      console.error('Error fetching Wingo history:', e);
+      // Graceful retry on transient network reconnection
+      console.warn('Wingo history sync retry:', e);
     }
   };
 
@@ -372,14 +373,14 @@ export default function App() {
     }
   }, [aiAlgorithm, methodPredictions]);
 
-  // High-frequency Poller: Polls backend every 1.5s so timer and period stay locked to shwelottery.net
+  // Poller: Keeps timer and period locked to shwelottery.net
   useEffect(() => {
     const pollInterval = setInterval(() => {
       fetchWingoData(selectedTypeId);
-    }, 1500);
+    }, 2000);
 
     return () => clearInterval(pollInterval);
-  }, [selectedTypeId, sensitivity, soundEnabled, aiAlgorithm]);
+  }, [selectedTypeId]);
 
   // 1-Second Local Tick
   useEffect(() => {

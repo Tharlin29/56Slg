@@ -189,13 +189,14 @@ export const PlayableGameStation: React.FC<PlayableGameStationProps> = ({
         }
       }
     } catch (err) {
-      console.error('Real balance sync error:', err);
+      // Graceful retry on transient network glitch or dev server restart
+      console.warn('Real balance sync retry:', err);
     }
   };
 
   useEffect(() => {
     fetchRealLiveBalance();
-    const balInterval = setInterval(fetchRealLiveBalance, 3000);
+    const balInterval = setInterval(fetchRealLiveBalance, 6000);
     return () => clearInterval(balInterval);
   }, []);
 
